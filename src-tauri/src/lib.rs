@@ -74,10 +74,16 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Manages active file watchers
+/// Holds a watcher and its background flush task; dropping stops both.
+struct WatchHandle {
+    _watcher: notify::RecommendedWatcher,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+/// Manages active file watchers with debounced event batching
 #[derive(Default)]
 struct WatcherManager {
-    watchers: Arc<TokioMutex<HashMap<String, notify::RecommendedWatcher>>>,
+    watchers: Arc<TokioMutex<HashMap<String, WatchHandle>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2291,8 +2297,14 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
 
-                                // Read first few lines to extract preview and cwd
-                                let (preview, cwd) = extract_session_info(&path);
+                                // Read first few lines to extract preview, cwd, and check if
+                                // this is a real conversation (has assistant reply).
+                                let (preview, cwd, has_assistant) = extract_session_info(&path);
+
+                                // Skip ghost sessions — auto-title tasks, aborted enqueue, etc.
+                                if !has_assistant {
+                                    continue;
+                                }
 
                                 // Use cwd from JSONL if available (authoritative),
                                 // otherwise fall back to decoding the directory name.
@@ -2702,17 +2714,18 @@ fn search_session_file(path: &std::path::Path, query_lower: &str) -> Option<serd
 
 /// Extract preview (first user message) and cwd from a session .jsonl file.
 /// Returns (preview, cwd) — cwd may be empty if not found.
-fn extract_session_info(path: &std::path::Path) -> (String, String) {
+fn extract_session_info(path: &std::path::Path) -> (String, String, bool) {
     use std::io::BufRead;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (String::new(), String::new()),
+        Err(_) => return (String::new(), String::new(), false),
     };
     let reader = std::io::BufReader::new(file);
     let mut cwd = String::new();
     let mut preview = String::new();
+    let mut has_assistant = false;
 
-    // Scan up to 100 lines to find cwd and first real user message.
+    // Scan up to 100 lines to find cwd, first real user message, and any assistant reply.
     for line in reader.lines().take(100) {
         let line = match line {
             Ok(l) => l,
@@ -2722,6 +2735,11 @@ fn extract_session_info(path: &std::path::Path) -> (String, String) {
             Ok(j) => j,
             Err(_) => continue,
         };
+
+        // Detect real assistant reply (not a ghost/auto-title session)
+        if !has_assistant {
+            has_assistant = json["type"].as_str() == Some("assistant");
+        }
 
         // Extract cwd from the first line that has it
         if cwd.is_empty() {
@@ -2798,7 +2816,7 @@ fn extract_session_info(path: &std::path::Path) -> (String, String) {
             break;
         }
     }
-    (preview, cwd)
+    (preview, cwd, has_assistant)
 }
 
 /// Decode project directory name back to readable path.
@@ -3737,7 +3755,8 @@ async fn list_recent_projects() -> Result<Vec<Value>, String> {
     Ok(result)
 }
 
-/// Start watching a directory for file changes, emit events to frontend
+/// Start watching a directory for file changes, emit batched events to frontend.
+/// Events are collected into 200ms windows to avoid IPC storms on high-frequency dirs.
 #[tauri::command]
 async fn watch_directory(
     app: AppHandle,
@@ -3745,15 +3764,14 @@ async fn watch_directory(
     path: String,
 ) -> Result<(), String> {
     use notify::{Event, EventKind, RecursiveMode, Watcher};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     // Stop existing watcher for this path if any
     {
         let mut watchers = state.watchers.lock().await;
         watchers.remove(&path);
     }
-
-    let app_clone = app.clone();
-    let path_clone = path.clone();
 
     // Directories whose changes are noise for the UI (high-frequency writes by CLI, git, etc.)
     const IGNORED_SEGMENTS: &[&str] = &[
@@ -3766,6 +3784,93 @@ async fn watch_directory(
         ".venv",
     ];
 
+    // Shared buffer: events accumulate here between flush cycles.
+    // std::sync::Mutex because the notify callback runs on a non-async OS thread.
+    let pending: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let pending_for_watcher = pending.clone();
+
+    // Shutdown signal: dropping the sender → receiver fires → flush task drains and exits.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app_for_flush = app.clone();
+    let path_for_flush = path.clone();
+
+    // Background flush task: every 200ms, merge buffered events and emit a single IPC event
+    let _flush = tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    let mut buf = match pending.lock() {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    if buf.is_empty() {
+                        continue;
+                    }
+                    let events: Vec<_> = buf.drain(..).collect();
+                    drop(buf);
+
+                    let mut seen = std::collections::HashSet::new();
+                    let mut all_paths = Vec::new();
+                    for (_, paths) in &events {
+                        for p in paths {
+                            if seen.insert(p.clone()) {
+                                all_paths.push(p.clone());
+                            }
+                        }
+                    }
+
+                    let primary_kind = if events.iter().any(|(k, _)| k == "created" || k == "removed") {
+                        if events.iter().any(|(k, _)| k == "created") { "created" } else { "removed" }
+                    } else {
+                        "modified"
+                    };
+
+                    let _ = app_for_flush.emit(
+                        "fs:change",
+                        serde_json::json!({
+                            "kind": primary_kind,
+                            "paths": all_paths,
+                            "root": path_for_flush,
+                        }),
+                    );
+                }
+                _ = &mut shutdown_rx => {
+                    // Final drain before exit
+                    if let Ok(mut buf) = pending.lock() {
+                        if !buf.is_empty() {
+                            let events: Vec<_> = buf.drain(..).collect();
+                            drop(buf);
+                            let mut seen = std::collections::HashSet::new();
+                            let mut all_paths = Vec::new();
+                            for (_, paths) in &events {
+                                for p in paths {
+                                    if seen.insert(p.clone()) {
+                                        all_paths.push(p.clone());
+                                    }
+                                }
+                            }
+                            let primary_kind = if events.iter().any(|(k, _)| k == "created" || k == "removed") {
+                                if events.iter().any(|(k, _)| k == "created") { "created" } else { "removed" }
+                            } else {
+                                "modified"
+                            };
+                            let _ = app_for_flush.emit(
+                                "fs:change",
+                                serde_json::json!({
+                                    "kind": primary_kind,
+                                    "paths": all_paths,
+                                    "root": path_for_flush,
+                                }),
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
             let kind = match event.kind {
@@ -3774,7 +3879,6 @@ async fn watch_directory(
                 EventKind::Remove(_) => "removed",
                 _ => return,
             };
-            // Filter out paths under ignored directories to prevent UI render storms
             let paths: Vec<String> = event
                 .paths
                 .iter()
@@ -3790,14 +3894,9 @@ async fn watch_directory(
             if paths.is_empty() {
                 return;
             }
-            let _ = app_clone.emit(
-                "fs:change",
-                serde_json::json!({
-                    "kind": kind,
-                    "paths": paths,
-                    "root": path_clone,
-                }),
-            );
+            if let Ok(mut buf) = pending_for_watcher.lock() {
+                buf.push((kind.to_string(), paths));
+            }
         }
     })
     .map_err(|e| format!("Failed to create watcher: {}", e))?;
@@ -3807,7 +3906,13 @@ async fn watch_directory(
         .map_err(|e| format!("Failed to watch: {}", e))?;
 
     let mut watchers = state.watchers.lock().await;
-    watchers.insert(path, watcher);
+    watchers.insert(
+        path,
+        WatchHandle {
+            _watcher: watcher,
+            _shutdown: shutdown_tx,
+        },
+    );
 
     Ok(())
 }
