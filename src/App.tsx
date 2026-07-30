@@ -138,6 +138,8 @@ function App() {
   const refreshTree = useFileStore((s) => s.refreshTree);
   const markFileChanged = useFileStore((s) => s.markFileChanged);
   const prevDirRef = useRef<string | null>(null);
+  const homeDirRef = useRef<string>('');
+  const [homeDirReady, setHomeDirReady] = useState(false);
 
   const t = useT();
 
@@ -392,6 +394,7 @@ function App() {
   useEffect(() => {
     useSessionStore.getState().loadCustomPreviewsFromDisk();
     useProviderStore.getState().load();
+    bridge.getHomeDir().then((dir) => { homeDirRef.current = dir; setHomeDirReady(true); }).catch(() => setHomeDirReady(true));
     // Notification permission is requested lazily on first need (see useStreamProcessor.ts)
   }, []);
 
@@ -589,6 +592,14 @@ function App() {
   useEffect(() => {
     if (!workingDirectory) return;
 
+    // Never watch the user's home directory — it has too many system file changes
+    const normalizedHome = homeDirRef.current.replace(/\\/g, '/').replace(/\/$/, '');
+    const normalizedWorkdir = workingDirectory.replace(/\\/g, '/').replace(/\/$/, '');
+    if (normalizedWorkdir === normalizedHome) {
+      console.log('[TOKENICODE] Skipping file watch on home directory:', workingDirectory);
+      return;
+    }
+
     // Unwatch previous directory
     if (prevDirRef.current && prevDirRef.current !== workingDirectory) {
       bridge.unwatchDirectory(prevDirRef.current).catch(() => {});
@@ -602,7 +613,7 @@ function App() {
     return () => {
       bridge.unwatchDirectory(workingDirectory).catch(() => {});
     };
-  }, [workingDirectory]);
+  }, [workingDirectory, homeDirReady]);
 
   // Listen for file change events from the watcher
   // Debounce tree refresh for created/removed events (structure changes)
