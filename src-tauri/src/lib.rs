@@ -351,21 +351,21 @@ fn system_proxy_url() -> Option<String> {
     if is_enabled("HTTPSEnable") {
         if let (Some(host), Some(port)) = (get_val("HTTPSProxy"), get_val("HTTPSPort")) {
             let url = format!("http://{}:{}", host, port);
-            eprintln!("system proxy detected (HTTPS): {}", url);
+            eprintln!("system HTTPS proxy detected");
             return Some(url);
         }
     }
     if is_enabled("SOCKSEnable") {
         if let (Some(host), Some(port)) = (get_val("SOCKSProxy"), get_val("SOCKSPort")) {
             let url = format!("socks5://{}:{}", host, port);
-            eprintln!("system proxy detected (SOCKS): {}", url);
+            eprintln!("system SOCKS proxy detected");
             return Some(url);
         }
     }
     if is_enabled("HTTPEnable") {
         if let (Some(host), Some(port)) = (get_val("HTTPProxy"), get_val("HTTPPort")) {
             let url = format!("http://{}:{}", host, port);
-            eprintln!("system proxy detected (HTTP): {}", url);
+            eprintln!("system HTTP proxy detected");
             return Some(url);
         }
     }
@@ -391,7 +391,7 @@ fn probe_local_proxy() -> Option<String> {
         .is_ok()
         {
             let url = format!("{}://127.0.0.1:{}", scheme, port);
-            eprintln!("auto-detected local proxy: {}", url);
+            eprintln!("auto-detected local proxy");
             return Some(url);
         }
     }
@@ -508,14 +508,11 @@ async fn build_smart_http_client(
     if let Some(proxy_url) = resolve_proxy_url() {
         if is_proxy_reachable(&proxy_url).await {
             if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-                eprintln!("Smart proxy: using proxy {}", proxy_url);
+                eprintln!("Smart proxy: using configured proxy");
                 builder = builder.proxy(proxy);
             }
         } else {
-            eprintln!(
-                "Smart proxy: proxy {} unreachable, connecting directly",
-                proxy_url
-            );
+            eprintln!("Smart proxy: configured proxy unreachable, connecting directly");
         }
     }
 
@@ -860,13 +857,10 @@ fn providers_path() -> Result<std::path::PathBuf, String> {
 }
 
 // --- Provider credential encryption (TK-303) ---
-// The master key lives in safe_data_dir()/providers.key — the SAME user-home
-// directory as providers.json. That directory SURVIVES app updates (the NSIS
-// installer and the Tauri updater only replace the binary, never the home data
-// dir), so the key is always present after an update and decryption can never
-// fail due to an update. Cross-device sync is preserved: load/save encrypt and
-// decrypt transparently, while export/import operate on the in-memory plaintext
-// provider (so the exported JSON stays portable across machines).
+// Provider JSON is AES-GCM encrypted with a persistent random master key. On
+// Windows that key is sealed with DPAPI for the current OS user; legacy raw key
+// files are migrated on load. Unix builds retain owner-only file permissions.
+// Export/import still operates on explicit user-requested plaintext JSON.
 
 use rand::RngCore;
 use base64::Engine;
@@ -874,6 +868,103 @@ use base64::Engine;
 const ENC_MAGIC: &str = "TENC1:";
 const PROVIDER_KEY_FILE: &str = "providers.key";
 const MASTER_KEY_LEN: usize = 32;
+#[cfg(target_os = "windows")]
+const DPAPI_MAGIC: &[u8] = b"TDP1";
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct DataBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Crypt32")]
+unsafe extern "system" {
+    fn CryptProtectData(
+        data_in: *const DataBlob,
+        description: *const u16,
+        optional_entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        data_in: *const DataBlob,
+        description: *mut *mut u16,
+        optional_entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        data_out: *mut DataBlob,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_transform(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+    let input_blob = DataBlob {
+        cb_data: input.len() as u32,
+        pb_data: input.as_ptr() as *mut u8,
+    };
+    let mut output_blob = DataBlob { cb_data: 0, pb_data: std::ptr::null_mut() };
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input_blob, std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output_blob,
+            )
+        } else {
+            CryptUnprotectData(
+                &input_blob, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output_blob,
+            )
+        }
+    };
+    if ok == 0 || output_blob.pb_data.is_null() {
+        return Err("Windows credential protection failed".to_string());
+    }
+    let output = unsafe {
+        let value = std::slice::from_raw_parts(output_blob.pb_data, output_blob.cb_data as usize).to_vec();
+        let _ = LocalFree(output_blob.pb_data as *mut std::ffi::c_void);
+        value
+    };
+    Ok(output)
+}
+
+#[cfg(target_os = "windows")]
+fn seal_master_key(key: &[u8; MASTER_KEY_LEN]) -> Result<Vec<u8>, String> {
+    let mut stored = DPAPI_MAGIC.to_vec();
+    stored.extend_from_slice(&dpapi_transform(key, true)?);
+    Ok(stored)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn seal_master_key(key: &[u8; MASTER_KEY_LEN]) -> Result<Vec<u8>, String> {
+    Ok(key.to_vec())
+}
+
+#[cfg(target_os = "windows")]
+fn open_master_key(raw: &[u8]) -> Result<[u8; MASTER_KEY_LEN], String> {
+    let plain = if raw.starts_with(DPAPI_MAGIC) {
+        dpapi_transform(&raw[DPAPI_MAGIC.len()..], false)?
+    } else {
+        raw.to_vec()
+    };
+    plain.try_into().map_err(|_| "Invalid provider master key".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_master_key(raw: &[u8]) -> Result<[u8; MASTER_KEY_LEN], String> {
+    raw.try_into().map_err(|_| "Invalid provider master key".to_string())
+}
 
 #[cfg(unix)]
 fn harden_path_permissions(path: &std::path::Path) {
@@ -893,11 +984,12 @@ fn load_or_create_master_key() -> Result<[u8; MASTER_KEY_LEN], String> {
     let path = provider_key_path()?;
     if path.exists() {
         let raw = std::fs::read(&path).map_err(|e| format!("读取密钥失败: {}", e))?;
-        if raw.len() != MASTER_KEY_LEN {
-            return Err("主密钥文件损坏".to_string());
+        let key = open_master_key(&raw)?;
+        #[cfg(target_os = "windows")]
+        if !raw.starts_with(DPAPI_MAGIC) {
+            std::fs::write(&path, seal_master_key(&key)?)
+                .map_err(|e| format!("Failed to migrate provider key protection: {}", e))?;
         }
-        let mut key = [0u8; MASTER_KEY_LEN];
-        key.copy_from_slice(&raw);
         return Ok(key);
     }
     let mut key = [0u8; MASTER_KEY_LEN];
@@ -905,7 +997,8 @@ fn load_or_create_master_key() -> Result<[u8; MASTER_KEY_LEN], String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("无法创建目录: {}", e))?;
     }
-    std::fs::write(&path, &key).map_err(|e| format!("写入密钥失败: {}", e))?;
+    std::fs::write(&path, seal_master_key(&key)?)
+        .map_err(|e| format!("写入密钥失败: {}", e))?;
     harden_path_permissions(&path);
     Ok(key)
 }
@@ -1025,7 +1118,7 @@ async fn test_provider_connection(
         if !purl.is_empty() {
             if let Ok(proxy) = reqwest::Proxy::all(purl) {
                 if is_proxy_reachable(purl).await {
-                    eprintln!("test_provider_connection: using provider proxy {}", purl);
+                    eprintln!("test_provider_connection: using configured provider proxy");
                     reqwest::Client::builder()
                         .connect_timeout(std::time::Duration::from_secs(10))
                         .timeout(std::time::Duration::from_secs(30))
@@ -1034,7 +1127,7 @@ async fn test_provider_connection(
                         .build()
                         .unwrap_or_default()
                 } else {
-                    eprintln!("test_provider_connection: provider proxy {} unreachable, direct", purl);
+                    eprintln!("test_provider_connection: configured provider proxy unreachable, direct");
                     build_smart_http_client(
                         std::time::Duration::from_secs(10),
                         std::time::Duration::from_secs(30),
@@ -1636,9 +1729,13 @@ async fn start_claude_session(
         "[TOKENICODE] CLI spawned: pid={}, bin={}, permission_mode={}",
         pid, claude_bin, permission_mode
     );
-    eprintln!("[TOKENICODE] args: {:?}", &args);
-    eprintln!("[TOKENICODE] PATH: {}", &enriched_path);
-    eprintln!("[TOKENICODE] resolved_env: {:?}", &resolved_env);
+    // Never log subprocess arguments, PATH, or environment values: provider
+    // API keys and proxy credentials may be present in those values.
+    eprintln!(
+        "[TOKENICODE] runtime config: args={}, env_keys={}",
+        args.len(),
+        resolved_env.len()
+    );
     eprintln!("[TOKENICODE] cwd: {}", &params.cwd);
 
     // Capture stdin and store in StdinManager for sending follow-up messages
@@ -2181,6 +2278,29 @@ async fn track_session(session_id: String) -> Result<(), String> {
         .open(&path)
         .map_err(|e| format!("Failed to open tracked sessions: {}", e))?;
     writeln!(file, "{}", session_id).map_err(|e| format!("Failed to write session ID: {}", e))?;
+    Ok(())
+}
+
+/// Hide a superseded session from TOKENICODE without deleting its JSONL file.
+/// Rewind uses this to replace the visible branch while keeping recovery data.
+#[tauri::command]
+async fn untrack_session(session_id: String) -> Result<(), String> {
+    let path = tracked_sessions_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    use std::io::BufRead;
+    let contents: Vec<String> = std::io::BufReader::new(
+        std::fs::File::open(&path).map_err(|e| format!("Failed to read tracked sessions: {}", e))?,
+    )
+    .lines()
+    .flatten()
+    .filter(|line| line.trim() != session_id)
+    .collect();
+    let tmp = path.with_extension("txt.tmp");
+    let body = if contents.is_empty() { String::new() } else { contents.join("\n") + "\n" };
+    std::fs::write(&tmp, body).map_err(|e| format!("Failed to write tracked sessions: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to rename tracked sessions: {}", e))?;
     Ok(())
 }
 
@@ -4160,6 +4280,38 @@ struct SkillTranslationConfig {
     proxy_url: Option<String>,
 }
 
+fn skill_translation_config_path() -> Result<std::path::PathBuf, String> {
+    Ok(safe_data_dir()?.join("skill-translation.json"))
+}
+
+#[tauri::command]
+fn load_skill_translation_config() -> Result<Option<SkillTranslationConfig>, String> {
+    let path = skill_translation_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read skill translation config: {}", e))?;
+    let json = decrypt_providers(&raw)?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|e| format!("Cannot parse skill translation config: {}", e))
+}
+
+#[tauri::command]
+fn save_skill_translation_config(config: SkillTranslationConfig) -> Result<(), String> {
+    let path = skill_translation_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create dir: {}", e))?;
+    }
+    let json = serde_json::to_string(&config)
+        .map_err(|e| format!("Serialize error: {}", e))?;
+    let sealed = encrypt_providers(&json)?;
+    std::fs::write(&path, sealed).map_err(|e| format!("Write error: {}", e))?;
+    harden_path_permissions(&path);
+    Ok(())
+}
+
 /// YAML frontmatter fields for SKILL.md files
 #[derive(Debug, Deserialize, Default)]
 struct SkillFrontmatter {
@@ -4335,6 +4487,11 @@ fn collect_skill_files(dir: &std::path::Path, max_depth: usize) -> Vec<std::path
     }
 
     let mut found = Vec::new();
+    let direct = dir.join("SKILL.md");
+    if direct.exists() {
+        found.push(direct);
+        return found;
+    }
     visit(dir, 0, max_depth, &mut found);
     found
 }
@@ -4397,9 +4554,16 @@ fn scan_skill_commands(dir: &std::path::Path, source: &str) -> Vec<UnifiedComman
     collect_skill_files(dir, 8)
         .into_iter()
         .map(|skill_file| {
-            let (name, description, fm) = skill_display_fields(&skill_file);
+            let (_display_name, description, fm) = skill_display_fields(&skill_file);
+            // Claude invokes a skill by its directory name, not an optional
+            // human-facing `name` in frontmatter.
+            let command_name = skill_file
+                .parent()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
             UnifiedCommand {
-                name: format!("/{}", name),
+                name: format!("/{}", command_name),
                 description,
                 source: source.to_string(),
                 category: "skill".to_string(),
@@ -4441,30 +4605,25 @@ fn dedupe_unified_skill_commands(commands: Vec<UnifiedCommand>) -> Vec<UnifiedCo
 
 /// Scan and return all available skills (global + project)
 #[tauri::command]
-async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
+async fn list_skills(cwd: Option<String>, additional_dirs: Option<Vec<String>>) -> Result<Vec<SkillInfo>, String> {
     let mut skills: Vec<SkillInfo> = vec![];
 
-    // Global skills: Codex, legacy Claude, and shared agent skill directories.
+    // Only Claude's native skill directory is scanned by default. Codex and
+    // other agent-specific skills are not necessarily compatible with Claude.
     if let Some(home) = dirs::home_dir() {
-        for dir in [
-            home.join(".codex").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".claude").join("skills"),
-            home.join(".codex").join("plugins").join("cache"),
-        ] {
-            skills.extend(scan_skill_infos(&dir, "global"));
-        }
+        skills.extend(scan_skill_infos(&home.join(".claude").join("skills"), "global"));
     }
 
-    // Project skills: prefer Codex layout, keep Claude layout for compatibility.
+    // Project-local Claude skills.
     if let Some(ref cwd_path) = cwd {
         let cwd = std::path::Path::new(cwd_path);
-        for dir in [
-            cwd.join(".codex").join("skills"),
-            cwd.join(".agents").join("skills"),
-            cwd.join(".claude").join("skills"),
-        ] {
-            skills.extend(scan_skill_infos(&dir, "project"));
+        skills.extend(scan_skill_infos(&cwd.join(".claude").join("skills"), "project"));
+    }
+
+    for dir in additional_dirs.unwrap_or_default() {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_absolute() {
+            skills.extend(scan_skill_infos(&path, "global"));
         }
     }
 
@@ -5007,7 +5166,7 @@ async fn delete_skill(path: String) -> Result<(), String> {
 
 /// Unified endpoint that returns all commands and skills in a single call
 #[tauri::command]
-async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, String> {
+async fn list_all_commands(cwd: Option<String>, additional_dirs: Option<Vec<String>>) -> Result<Vec<UnifiedCommand>, String> {
     let mut commands: Vec<UnifiedCommand> = vec![];
 
     // 1. Built-in commands: (name, description, has_args, execution)
@@ -5154,27 +5313,22 @@ async fn list_all_commands(cwd: Option<String>) -> Result<Vec<UnifiedCommand>, S
         commands.extend(scan_commands_dir(&project_dir, "project"));
     }
 
-    // 4. Global skills: Codex, legacy Claude, and shared agent skill directories.
+    // 4. Global Claude skills only.
     if let Some(home) = dirs::home_dir() {
-        for dir in [
-            home.join(".codex").join("skills"),
-            home.join(".agents").join("skills"),
-            home.join(".claude").join("skills"),
-            home.join(".codex").join("plugins").join("cache"),
-        ] {
-            commands.extend(scan_skill_commands(&dir, "global"));
-        }
+        commands.extend(scan_skill_commands(&home.join(".claude").join("skills"), "global"));
     }
 
-    // 5. Project skills: prefer Codex layout, keep Claude layout for compatibility.
+    // 5. Project-local Claude skills.
     if let Some(ref cwd_path) = cwd {
         let cwd = std::path::Path::new(cwd_path);
-        for dir in [
-            cwd.join(".codex").join("skills"),
-            cwd.join(".agents").join("skills"),
-            cwd.join(".claude").join("skills"),
-        ] {
-            commands.extend(scan_skill_commands(&dir, "project"));
+        commands.extend(scan_skill_commands(&cwd.join(".claude").join("skills"), "project"));
+    }
+
+    // 6. User-selected compatible skill roots.
+    for dir in additional_dirs.unwrap_or_default() {
+        let path = std::path::PathBuf::from(dir);
+        if path.is_absolute() {
+            commands.extend(scan_skill_commands(&path, "global"));
         }
     }
 
@@ -8043,6 +8197,7 @@ pub fn run() {
             kill_session,
             list_active_processes,
             track_session,
+            untrack_session,
             delete_session,
             list_sessions,
             get_profile_stats,
@@ -8072,6 +8227,8 @@ pub fn run() {
             read_file_base64,
             list_slash_commands,
             list_skills,
+            load_skill_translation_config,
+            save_skill_translation_config,
             read_skill,
             write_skill,
             delete_skill,
@@ -8125,6 +8282,15 @@ pub fn run() {
 #[cfg(test)]
 mod decode_tests {
     use super::{decode_project_name, provider_messages_endpoint};
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_dpapi_master_key_roundtrip() {
+        let key = [42u8; super::MASTER_KEY_LEN];
+        let sealed = super::seal_master_key(&key).expect("seal key");
+        assert!(sealed.starts_with(super::DPAPI_MAGIC));
+        assert_eq!(super::open_master_key(&sealed).expect("open key"), key);
+    }
 
     #[test]
     fn test_openai_endpoint_keeps_deepseek_bare_base_url() {

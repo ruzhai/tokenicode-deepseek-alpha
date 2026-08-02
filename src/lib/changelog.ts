@@ -19,6 +19,35 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '1.0.7',
+    date: '2026-08-02',
+    highlights: {
+      zh: ['会话、模型、Skills、内置浏览器与密钥安全集中修复'],
+      en: ['Session, model, Skills, browser, and credential security fixes'],
+    },
+    categories: [
+      {
+        label: { zh: '修复', en: 'Fixed' },
+        items: {
+          zh: [
+            '修复回退后历史会话重复、文件监听风暴和任务完成后不发送回复的问题',
+            '模型名称跟随实际 Provider 映射，Claude 不再显示为 DeepSeek，并恢复真实思考状态',
+            'Skills 斜杠调用支持单个和多个技能；默认只扫描 Claude 目录，也可手动添加目录',
+            '外部网页改用独立内置浏览窗口，移除无实际截图能力的伪截屏按钮',
+            'Provider 与 Skills 翻译 API Key 改用 DPAPI 保护，并停止输出可能泄露密钥的运行日志',
+          ],
+          en: [
+            'Fixed duplicate rewind history, file-watcher event storms, and completed tasks that never delivered a reply',
+            'Model labels now follow the active provider mapping; Claude is no longer mislabeled as DeepSeek, and real thinking status is preserved',
+            'Slash Skills support one or multiple selections; only Claude directories are scanned by default, with custom roots available',
+            'External pages open in a dedicated in-app browser window; the non-functional snapshot control was removed',
+            'Provider and Skills translation API keys are protected with Windows DPAPI and credential-bearing runtime logs are no longer emitted',
+          ],
+        },
+      },
+    ],
+  },
+  {
     version: '0.10.0',
     date: '2026-04-05',
     highlights: {

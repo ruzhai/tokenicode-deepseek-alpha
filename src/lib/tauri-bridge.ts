@@ -318,6 +318,9 @@ export const bridge = {
   trackSession: (sessionId: string) =>
     invoke<void>('track_session', { sessionId }),
 
+  untrackSession: (sessionId: string) =>
+    invoke<void>('untrack_session', { sessionId }),
+
   deleteSession: (sessionId: string, sessionPath: string) =>
     invoke<void>('delete_session', { sessionId, sessionPath }),
 
@@ -408,8 +411,8 @@ export const bridge = {
     invoke<SlashCommand[]>('list_slash_commands', { cwd }),
 
   // Skills
-  listSkills: (cwd?: string) =>
-    invoke<SkillInfo[]>('list_skills', { cwd }),
+  listSkills: (cwd?: string, additionalDirs: string[] = []) =>
+    invoke<SkillInfo[]>('list_skills', { cwd, additionalDirs }),
 
   readSkill: (path: string) =>
     invoke<string>('read_skill', { path }),
@@ -437,9 +440,15 @@ export const bridge = {
   translateSkillMarkdown: (content: string, config: SkillTranslationConfig) =>
     invoke<string>('translate_skill_markdown', { content, config }),
 
+  loadSkillTranslationConfig: () =>
+    invoke<SkillTranslationConfig | null>('load_skill_translation_config'),
+
+  saveSkillTranslationConfig: (config: SkillTranslationConfig) =>
+    invoke<void>('save_skill_translation_config', { config }),
+
   // Unified commands (commands + skills)
-  listAllCommands: (cwd?: string) =>
-    invoke<UnifiedCommand[]>('list_all_commands', { cwd }),
+  listAllCommands: (cwd?: string, additionalDirs: string[] = []) =>
+    invoke<UnifiedCommand[]>('list_all_commands', { cwd, additionalDirs }),
 
   // Git commands (safe, allowlisted operations only)
   runGitCommand: (cwd: string, args: string[]) =>
