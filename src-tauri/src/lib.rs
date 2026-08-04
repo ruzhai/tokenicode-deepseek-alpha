@@ -1793,30 +1793,23 @@ async fn start_claude_session(
                 }
             };
             line_count += 1;
-            // Log first 10 lines with timing to diagnose startup delay
-            if line_count <= 10 {
-                let elapsed = spawn_time.elapsed().as_millis();
-                let preview = if line.len() > 150 {
-                    &line[..150]
-                } else {
-                    &line
-                };
-                eprintln!(
-                    "[TOKENICODE:stdout] #{} @{}ms type={} preview={}",
-                    line_count,
-                    elapsed,
-                    serde_json::from_str::<Value>(&line)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
-                        .unwrap_or_else(|| "?".into()),
-                    preview
-                );
-            }
             // Parse every line as a JSON Value first (avoids serde enum pitfalls)
             let json = match serde_json::from_str::<Value>(&line) {
                 Ok(v) => v,
                 Err(_) => continue, // skip non-JSON lines
             };
+            // Keep startup diagnostics without persisting prompts, responses,
+            // thinking text, tool input, or other user data in application logs.
+            if line_count <= 10 {
+                eprintln!(
+                    "[TOKENICODE:stdout] #{} @{}ms type={} subtype={} bytes={}",
+                    line_count,
+                    spawn_time.elapsed().as_millis(),
+                    json.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+                    json.get("subtype").and_then(|v| v.as_str()).unwrap_or("-"),
+                    line.len(),
+                );
+            }
 
             // Intercept control_request messages for SDK control protocol routing.
             // All modes use --permission-prompt-tool stdio. In bypass mode, we
@@ -2417,14 +2410,10 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
 
-                                // Read first few lines to extract preview, cwd, and check if
-                                // this is a real conversation (has assistant reply).
-                                let (preview, cwd, has_assistant) = extract_session_info(&path);
-
-                                // Skip ghost sessions — auto-title tasks, aborted enqueue, etc.
-                                if !has_assistant {
-                                    continue;
-                                }
+                                // Read the first few lines to extract preview and cwd.
+                                // A tracked session must remain visible even when it has no
+                                // assistant record yet (for example after an API failure).
+                                let (preview, cwd) = extract_session_info(&path);
 
                                 // Use cwd from JSONL if available (authoritative),
                                 // otherwise fall back to decoding the directory name.
@@ -2834,18 +2823,17 @@ fn search_session_file(path: &std::path::Path, query_lower: &str) -> Option<serd
 
 /// Extract preview (first user message) and cwd from a session .jsonl file.
 /// Returns (preview, cwd) — cwd may be empty if not found.
-fn extract_session_info(path: &std::path::Path) -> (String, String, bool) {
+fn extract_session_info(path: &std::path::Path) -> (String, String) {
     use std::io::BufRead;
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return (String::new(), String::new(), false),
+        Err(_) => return (String::new(), String::new()),
     };
     let reader = std::io::BufReader::new(file);
     let mut cwd = String::new();
     let mut preview = String::new();
-    let mut has_assistant = false;
 
-    // Scan up to 100 lines to find cwd, first real user message, and any assistant reply.
+    // Scan up to 100 lines to find cwd and the first real user message.
     for line in reader.lines().take(100) {
         let line = match line {
             Ok(l) => l,
@@ -2855,11 +2843,6 @@ fn extract_session_info(path: &std::path::Path) -> (String, String, bool) {
             Ok(j) => j,
             Err(_) => continue,
         };
-
-        // Detect real assistant reply (not a ghost/auto-title session)
-        if !has_assistant {
-            has_assistant = json["type"].as_str() == Some("assistant");
-        }
 
         // Extract cwd from the first line that has it
         if cwd.is_empty() {
@@ -2936,7 +2919,7 @@ fn extract_session_info(path: &std::path::Path) -> (String, String, bool) {
             break;
         }
     }
-    (preview, cwd, has_assistant)
+    (preview, cwd)
 }
 
 /// Decode project directory name back to readable path.
@@ -3095,12 +3078,61 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
     Ok(messages)
 }
 
-/// Compute cumulative token totals from a Claude session JSONL file.
-/// Reads message_start.input_tokens and message_delta.output_tokens events.
+/// Compute billing totals and the latest occupied-context snapshot from a
+/// persisted Claude session JSONL file. Assistant records may be repeated once
+/// per content block, so totals are de-duplicated by message id.
+fn compute_session_tokens<R: std::io::BufRead>(reader: R) -> Value {
+    let mut seen_message_ids = std::collections::HashSet::new();
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
+    let mut context_input_tokens: u64 = 0;
+    let mut context_output_tokens: u64 = 0;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(json) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if json["type"].as_str() != Some("assistant") {
+            continue;
+        }
+        let message = &json["message"];
+        let usage = &message["usage"];
+        if !usage.is_object() {
+            continue;
+        }
+
+        let input = usage["input_tokens"].as_u64().unwrap_or(0);
+        let output = usage["output_tokens"].as_u64().unwrap_or(0);
+        let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        let direct_cache_creation = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        let cache_creation = if direct_cache_creation > 0 {
+            direct_cache_creation
+        } else {
+            usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0)
+                + usage["cache_creation"]["ephemeral_5m_input_tokens"].as_u64().unwrap_or(0)
+        };
+
+        // The latest assistant API call is the authoritative context snapshot.
+        context_input_tokens = input + cache_read + cache_creation;
+        context_output_tokens = output;
+
+        let message_id = message["id"].as_str().unwrap_or_default();
+        if !message_id.is_empty() && seen_message_ids.insert(message_id.to_string()) {
+            total_input_tokens += input;
+            total_output_tokens += output;
+        }
+    }
+
+    serde_json::json!({
+        "totalInputTokens": total_input_tokens,
+        "totalOutputTokens": total_output_tokens,
+        "contextInputTokens": context_input_tokens,
+        "contextOutputTokens": context_output_tokens,
+    })
+}
+
 #[tauri::command]
 async fn get_session_tokens(session_id: String) -> Result<Value, String> {
-    use std::io::BufRead;
-
     // Find the JSONL file: ~/.claude/projects/<any-project>/<session_id>.jsonl
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let projects_dir = home.join(".claude").join("projects");
@@ -3125,46 +3157,7 @@ async fn get_session_tokens(session_id: String) -> Result<Value, String> {
 
     let file = std::fs::File::open(&path)
         .map_err(|e| format!("Failed to open session JSONL: {}", e))?;
-    let reader = std::io::BufReader::new(file);
-
-    let mut total_input_tokens: u64 = 0;
-    let mut total_output_tokens: u64 = 0;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let json = match serde_json::from_str::<Value>(&line) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-
-        // Only process stream_event types
-        if json["type"].as_str() != Some("stream_event") {
-            continue;
-        }
-
-        let event = &json["event"];
-        match event["type"].as_str() {
-            Some("message_start") => {
-                if let Some(tokens) = event["message"]["usage"]["input_tokens"].as_u64() {
-                    total_input_tokens += tokens;
-                }
-            }
-            Some("message_delta") => {
-                if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
-                    total_output_tokens += tokens;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(serde_json::json!({
-        "totalInputTokens": total_input_tokens,
-        "totalOutputTokens": total_output_tokens,
-    }))
+    Ok(compute_session_tokens(std::io::BufReader::new(file)))
 }
 
 #[tauri::command]
@@ -8281,7 +8274,39 @@ pub fn run() {
 
 #[cfg(test)]
 mod decode_tests {
-    use super::{decode_project_name, provider_messages_endpoint};
+    use super::{compute_session_tokens, decode_project_name, extract_session_info, provider_messages_endpoint};
+
+    #[test]
+    fn test_session_tokens_use_latest_context_and_deduplicate_blocks() {
+        let jsonl = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"output_tokens\":20}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":900,\"output_tokens\":20}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"usage\":{\"input_tokens\":50,\"cache_read_input_tokens\":1050,\"output_tokens\":10}}}\n",
+        );
+        let usage = compute_session_tokens(std::io::Cursor::new(jsonl));
+        assert_eq!(usage["totalInputTokens"], 150);
+        assert_eq!(usage["totalOutputTokens"], 30);
+        assert_eq!(usage["contextInputTokens"], 1100);
+        assert_eq!(usage["contextOutputTokens"], 10);
+    }
+
+    #[test]
+    fn test_session_info_does_not_require_assistant_reply() {
+        let path = std::env::temp_dir().join(format!(
+            "tokenicode-session-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"type":"user","cwd":"D:\\work","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write test session");
+
+        let info = extract_session_info(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(info, ("hi".to_string(), r"D:\work".to_string()));
+    }
 
     #[cfg(target_os = "windows")]
     #[test]

@@ -337,7 +337,12 @@ export const bridge = {
     invoke<any[]>('load_session', { path }),
 
   getSessionTokens: (sessionId: string) =>
-    invoke<{ totalInputTokens: number; totalOutputTokens: number }>('get_session_tokens', { sessionId }),
+    invoke<{
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      contextInputTokens: number;
+      contextOutputTokens: number;
+    }>('get_session_tokens', { sessionId }),
 
   openInVscode: (path: string) =>
     invoke<void>('open_in_vscode', { path }),

@@ -679,7 +679,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const resultOutput = msg.usage?.output_tokens || 0;
           const streamedInput = prevMeta?.inputTokens || 0;
           const streamedOutput = prevMeta?.outputTokens || 0;
-          const snapshot = contextSnapshot(msg.usage);
           store.setSessionMeta(tabId, {
             cost: msg.total_cost_usd,
             duration: msg.duration_ms,
@@ -688,7 +687,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             outputTokens: resultOutput,
             totalInputTokens: (prevMeta?.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (prevMeta?.totalOutputTokens || 0) + (resultOutput - streamedOutput),
-            ...(snapshot ? snapshot : {}),
             turnStartTime: undefined,
             lastProgressAt: undefined,
           });
@@ -1849,7 +1847,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const resultOutput = msg.usage?.output_tokens || 0;
           const streamedInput = meta.inputTokens || 0;
           const streamedOutput = meta.outputTokens || 0;
-          const snapshot = contextSnapshot(msg.usage);
           setSessionMeta({
             cost: msg.total_cost_usd,
             duration: msg.duration_ms,
@@ -1858,7 +1855,6 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
             outputTokens: resultOutput,
             totalInputTokens: (meta.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (meta.totalOutputTokens || 0) + (resultOutput - streamedOutput),
-            ...(snapshot ? snapshot : {}),
             turnStartTime: undefined,
             lastProgressAt: undefined,
           });

@@ -2,6 +2,14 @@
 
 ## 更新记录
 
+### v1.0.8
+
+- 修复 AskUserQuestion 选项点击后只在界面显示已响应、却没有真正发送给模型的问题；答案现在按问题原文组装，并通过 Claude Code 控制协议回传。
+- 修复 v1.0.7 过滤掉部分历史会话的问题；即使会话尚未写入助手回复，也会继续保留在历史列表中，避免旧对话莫名消失。
+- 修复重新打开历史会话后上下文归零或重复计算的问题；应用会从持久化会话恢复最新上下文快照，并对重复的消息记录去重。
+- 完成态的思考过程默认展开，用户可以直接看到小字思考内容；发送 `hi`、弹窗选择、响应完成与重启后的历史恢复均已通过真实桌面交互验证。
+- 启动诊断日志只记录事件类型、耗时和字节数，不再写入提示词、回复、思考内容或工具参数。
+
 ### v1.0.7
 
 - 修复回退后旧分支与新分支同时出现在历史列表、JSONL 重放记录重复的问题；回退提示不再写进对话历史，旧记录仍保留在本机用于恢复。
@@ -181,8 +189,8 @@
 
 请到 GitHub Releases 下载对应系统的安装包：
 
-- Windows x64 便携版：`tokenicode-deepseek-alpha-v1.0.7-windows-x64.exe`
-- Windows x64 安装版：`tokenicode-deepseek-alpha-v1.0.7-windows-x64-setup.exe`
+- Windows x64 便携版：`tokenicode-deepseek-alpha-v1.0.8-windows-x64.exe`
+- Windows x64 安装版：`tokenicode-deepseek-alpha-v1.0.8-windows-x64-setup.exe`
 
 下载后双击运行即可。首次运行时请按需要配置 CC Switch / DeepSeek API。
 
