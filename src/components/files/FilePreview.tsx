@@ -226,7 +226,17 @@ export function FilePreview() {
     setSkillTranslationError(null);
     if (translatedSkillContent[selectedFile]) return;
 
-    const config = loadTranslationConfig();
+    // Load the config from the backend (same source as the Skills panel gear).
+    // The old localStorage key is removed by the SkillsPanel migration, so reading
+    // only localStorage here left the SKILL.md preview translation permanently
+    // unconfigured (showing "请先在技能面板齿轮里配置翻译 API").
+    let config = loadTranslationConfig();
+    try {
+      const saved = await bridge.loadSkillTranslationConfig();
+      if (saved) config = saved;
+    } catch {
+      // Fall back to the (legacy) localStorage value if the backend read fails.
+    }
     const normalizedConfig: SkillTranslationConfig = {
       ...config,
       baseUrl: config.baseUrl.trim(),
