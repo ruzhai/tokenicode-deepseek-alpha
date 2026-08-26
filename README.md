@@ -187,12 +187,12 @@
 
 ## 下载
 
-请到 GitHub Releases 下载对应系统的安装包：
+请到 [GitHub Releases](https://github.com/ruzhai/tokenicode-deepseek-alpha/releases/latest) 下载：
 
 - Windows x64 便携版：`tokenicode-deepseek-alpha-v1.0.8-windows-x64.exe`
-- Windows x64 安装版：`tokenicode-deepseek-alpha-v1.0.8-windows-x64-setup.exe`
+- SHA256 校验：`tokenicode-deepseek-alpha-v1.0.8-windows-x64.exe.sha256`
 
-下载后双击运行即可。首次运行时请按需要配置 CC Switch / DeepSeek API。
+下载后双击即可运行，或按下方「安装手册」部署到指定目录并创建桌面快捷方式。
 
 ## 快速开始
 
@@ -223,6 +223,76 @@
 - `Proxy URL`：可选，通常留空；仅需要代理时填写 `http://127.0.0.1:7890` 这类地址
 
 配置后点击 `译` 即可翻译技能列表。打开 `SKILL.md` 预览时，也可以点击右上角 `译` 翻译正文。
+
+## 安装手册（Windows）
+
+两种方式任选：**方式一**直接下载 release 便携版（最快，无需编译）；**方式二**从源码构建。
+
+### 方式一：下载 release 便携版（推荐）
+
+```powershell
+# 1) 建目录，并把下载的 tokenicode-deepseek-alpha-v1.0.8-windows-x64.exe
+#    放到 D:\TOKENICODE\tokenicode-deepseek-alpha.exe
+New-Item -ItemType Directory -Force D:\TOKENICODE | Out-Null
+
+# 2) 配置 API（主体 + 翻译都用 deepseek-v4-pro）
+$cfg = "$env:USERPROFILE\.tokenicode"
+New-Item -ItemType Directory -Force $cfg | Out-Null
+
+$providers = @'
+{
+  "version": 1,
+  "activeProviderId": "deepseek-v4-pro",
+  "providers": [
+    {
+      "id": "deepseek-v4-pro",
+      "name": "DeepSeek V4 Pro",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "apiFormat": "anthropic",
+      "apiKey": "填入你的DeepSeek_API_Key",
+      "modelMappings": [
+        { "tier": "opus", "providerModel": "deepseek-v4-pro" },
+        { "tier": "sonnet", "providerModel": "deepseek-v4-pro" },
+        { "tier": "haiku", "providerModel": "deepseek-v4-pro" }
+      ],
+      "preset": "deepseek"
+    }
+  ]
+}
+'@
+$translation = '{"baseUrl":"https://api.deepseek.com/anthropic","apiFormat":"anthropic","apiKey":"填入你的DeepSeek_API_Key","model":"deepseek-v4-pro"}'
+
+# 必须用 UTF-8 无 BOM 写入（带 BOM 会导致 Rust 解析失败）
+$enc = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText("$cfg\providers.json", $providers, $enc)
+[System.IO.File]::WriteAllText("$cfg\skill-translation.json", $translation, $enc)
+
+# 3) 桌面快捷方式
+$ws = New-Object -ComObject WScript.Shell
+$sc = $ws.CreateShortcut("$env:USERPROFILE\Desktop\TOKENICODE.lnk")
+$sc.TargetPath = "D:\TOKENICODE\tokenicode-deepseek-alpha.exe"
+$sc.WorkingDirectory = "D:\TOKENICODE"
+$sc.IconLocation = "D:\TOKENICODE\tokenicode-deepseek-alpha.exe,0"
+$sc.Save()
+
+# 4) 启动
+Start-Process "D:\TOKENICODE\tokenicode-deepseek-alpha.exe"
+```
+
+> 两处 `填入你的DeepSeek_API_Key` 需替换为真实 DeepSeek API Key；若无 D 盘，把 `D:\TOKENICODE` 换成任意路径。
+
+### 方式二：从源码构建
+
+环境要求见「本地开发」。构建命令：
+
+```powershell
+git clone https://github.com/ruzhai/tokenicode-deepseek-alpha
+cd tokenicode-deepseek-alpha
+pnpm install
+pnpm tauri build --no-bundle
+```
+
+产物为 `src-tauri\target\release\tokenicode.exe`，后续部署与配置同方式一。
 
 ## 本地开发
 
