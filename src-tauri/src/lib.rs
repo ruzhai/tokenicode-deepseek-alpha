@@ -8147,6 +8147,110 @@ async fn set_dock_icon(app: AppHandle, png_base64: String) -> Result<(), String>
     Ok(())
 }
 
+// ===== Cost monitor (ccusage token parsing + DeepSeek balance) =====
+
+/// Read the DeepSeek API key from ~/.claude/settings.json (env.ANTHROPIC_AUTH_TOKEN).
+/// Never logs or exposes the key.
+fn read_deepseek_api_key() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let raw = std::fs::read_to_string(home.join(".claude").join("settings.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let env = value.get("env")?;
+    env.get("ANTHROPIC_AUTH_TOKEN")
+        .or_else(|| env.get("ANTHROPIC_API_KEY"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Fetch the DeepSeek account balance (ground-truth remaining money).
+async fn fetch_deepseek_balance() -> Option<Value> {
+    let key = read_deepseek_api_key()?;
+    let client = build_smart_http_client(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    let resp = client
+        .get("https://api.deepseek.com/user/balance")
+        .header("Authorization", format!("Bearer {}", key))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
+}
+
+/// Run ccusage (the local JSONL usage analyzer) and return its JSON output.
+/// ccusage does the authoritative token aggregation; the frontend applies
+/// DeepSeek's own peak/off-peak pricing on top of those token counts.
+async fn run_ccusage_json() -> Result<Value, String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C")
+            .arg("npx")
+            .arg("--yes")
+            .arg("ccusage@20.0.20")
+            .arg("--json")
+            .arg("--sections")
+            .arg("session,daily");
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new("npx");
+        c.arg("--yes")
+            .arg("ccusage@20.0.20")
+            .arg("--json")
+            .arg("--sections")
+            .arg("session,daily");
+        c
+    };
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(25), cmd.output())
+        .await
+        .map_err(|_| "ccusage timed out".to_string())?
+        .map_err(|e| format!("failed to run ccusage: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "ccusage exited: {}",
+            stderr.trim().chars().take(300).collect::<String>()
+        ));
+    }
+    serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|e| format!("ccusage returned invalid JSON: {}", e))
+}
+
+#[tauri::command]
+async fn get_cost_monitor() -> Result<Value, String> {
+    let (usage, balance) = tokio::join!(run_ccusage_json(), fetch_deepseek_balance());
+
+    match usage {
+        Ok(json) => Ok(serde_json::json!({
+            "ok": true,
+            "daily": json.get("daily").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "session": json.get("session").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "balance": balance.unwrap_or(serde_json::Value::Null),
+        })),
+        Err(e) => Ok(serde_json::json!({
+            "ok": false,
+            "error": e,
+            "daily": [],
+            "session": [],
+            "balance": balance.unwrap_or(serde_json::Value::Null),
+        })),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -8205,6 +8309,7 @@ pub fn run() {
             delete_session,
             list_sessions,
             get_profile_stats,
+            get_cost_monitor,
             search_sessions,
             load_session,
             get_session_tokens,

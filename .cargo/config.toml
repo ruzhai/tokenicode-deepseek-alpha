@@ -1,0 +1,4 @@
+# 将本项目 Rust 编译缓存(target)重定向到 D 盘，避免占用 C 盘空间
+# 2026-09-06 设置
+[build]
+target-dir = "D:/rust-target/tk-src"

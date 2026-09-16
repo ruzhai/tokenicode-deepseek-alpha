@@ -1,6 +1,12 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { CostMonitor } from "./components/cost/CostMonitor";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+// The cost monitor is a separate Tauri window (label "cost-monitor").
+// Branch here so the floating window renders only the lightweight monitor.
+const isCostMonitor = getCurrentWindow().label === "cost-monitor";
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -92,7 +98,7 @@ class ErrorBoundary extends React.Component<
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     <ErrorBoundary>
-      <App />
+      {isCostMonitor ? <CostMonitor /> : <App />}
     </ErrorBoundary>
   </React.StrictMode>,
 );

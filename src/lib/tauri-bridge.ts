@@ -277,6 +277,60 @@ export interface UnifiedCommand {
   execution?: 'ui' | 'cli' | 'session';
 }
 
+// --- Cost monitor types (ccusage output shape) ---
+
+export interface CcusageModelBreakdown {
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  cost: number;
+  inputTokens: number;
+  modelName: string;
+  outputTokens: number;
+}
+
+export interface CcusageDailyRow {
+  period: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  totalCost: number;
+  modelsUsed: string[];
+  modelBreakdowns: CcusageModelBreakdown[];
+}
+
+export interface CcusageSessionRow {
+  period: string; // session id
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  totalCost: number;
+  modelsUsed: string[];
+  metadata: { lastActivity?: string };
+  modelBreakdowns: CcusageModelBreakdown[];
+}
+
+export interface DeepSeekBalance {
+  is_available: boolean;
+  balance_infos: Array<{
+    currency: string;
+    total_balance: string;
+    granted_balance: string;
+    topped_up_balance: string;
+  }>;
+}
+
+export interface CostMonitorData {
+  ok: boolean;
+  daily: CcusageDailyRow[];
+  session: CcusageSessionRow[];
+  balance: DeepSeekBalance | null;
+  error?: string;
+}
+
 // --- Bridge ---
 
 export const bridge = {
@@ -329,6 +383,9 @@ export const bridge = {
 
   getProfileStats: () =>
     invoke<ProfileStats>('get_profile_stats'),
+
+  getCostMonitor: () =>
+    invoke<CostMonitorData>('get_cost_monitor'),
 
   searchSessions: (query: string) =>
     invoke<ContentSearchResult[]>('search_sessions', { query }),

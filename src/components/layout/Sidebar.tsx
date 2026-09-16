@@ -62,6 +62,30 @@ export function Sidebar() {
     }
   };
 
+  const openCostMonitor = async () => {
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      let win = await WebviewWindow.getByLabel('cost-monitor');
+      if (!win) {
+        win = new WebviewWindow('cost-monitor', {
+          url: 'index.html',
+          title: 'API 成本监控',
+          width: 460,
+          height: 660,
+          minWidth: 360,
+          minHeight: 500,
+          resizable: true,
+          alwaysOnTop: true,
+          center: true,
+        });
+      }
+      await win.show();
+      await win.setFocus();
+    } catch (e) {
+      console.error('open cost monitor:', e);
+    }
+  };
+
   // Window dragging handled via CSS -webkit-app-region: drag on the top strip
 
   return (
@@ -196,6 +220,17 @@ export function Sidebar() {
             <path d="M8 1L1 4.5l7 3.5 7-3.5L8 1zM1 11.5l7 3.5 7-3.5M1 8l7 3.5L15 8" />
           </svg>
           {t('panel.skills')}
+        </button>
+        <button onClick={openCostMonitor}
+          className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl
+            text-sm text-text-muted hover:bg-bg-secondary hover:text-text-primary
+            transition-smooth">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round">
+            <path d="M2 13h12M2 9h12M2 5h12" />
+            <path d="M6 2v2M10 6v2M13 2v2" />
+          </svg>
+          成本监控
         </button>
         <button onClick={toggleSettings}
           className="w-full flex items-center gap-2.5 px-3 py-2 rounded-xl
